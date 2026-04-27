@@ -1,0 +1,210 @@
+import pandas as pd
+import re
+import sys
+from collections import OrderedDict
+
+# ===================== 全局配置 =====================
+# 等效频度词（不区分大小写，全部忽略）
+EQ_FREQ = {'qd', 'oncem', 'onc', 'once', 'bid'}
+# 等效天数符号：* × ×
+DAY_SYMBOLS = {'*', '×', '×'}
+# 匹配剂量：数字 + 可选单位（mg/iu等）
+DOSE_PATTERN = re.compile(r'(\d+\.?\d*)\s*([a-zA-Z]*)', re.IGNORECASE)
+# 匹配完整天数：*5天 / ×5天
+DAY_PATTERN = re.compile(r'([*××]\s*\d+\s*天)', re.IGNORECASE)
+# 提取天数数字
+DAY_NUM_PATTERN = re.compile(r'(\d+)\s*天', re.IGNORECASE)
+
+# 全局唯一药物列：key=药名+剂量，value=列名
+GLOBAL_DRUG_COLUMNS = OrderedDict()
+LOG_ENABLE = True
+
+
+# ===================== 工具函数 =====================
+def log(msg):
+    print(f"[INFO] {msg}")
+
+
+def clean_freq_words(text):
+    """清除频度词汇：qd、bid等"""
+    for word in EQ_FREQ:
+        text = re.sub(rf'\b{word}\b', '', text, flags=re.IGNORECASE)
+    return text
+
+
+def split_drug_items(raw_text):
+    """
+    拆分药物条目：支持逗号、换行、无逗号仅换行分隔
+    """
+    if pd.isna(raw_text):
+        return []
+
+    # 统一换行符
+    text = raw_text.replace('\r\n', '\n').replace('\r', '\n')
+    # 按 逗号 或 换行 分割
+    items = []
+    for part in re.split(r'[,|\n]', text):
+        part = part.strip()
+        if part:
+            items.append(part)
+    return items
+
+
+def parse_single_item(item):
+    """
+    解析单条药物：名称、剂量、天数
+    返回 (drug_name, dose_str, days) 或 None
+    """
+    original = item
+    item = clean_freq_words(item)
+
+    # 匹配天数
+    day_match = DAY_PATTERN.search(item)
+    days = 0
+    content = item
+
+    if day_match:
+        day_str = day_match.group(1)
+        num_match = DAY_NUM_PATTERN.search(day_str)
+        if num_match:
+            days = int(num_match.group(1))
+        # 去掉天数字段，剩余为名称+剂量
+        content = item.replace(day_str, '').strip()
+
+    # 匹配剂量（从后往前匹配最准确）
+    dose_match = DOSE_PATTERN.search(content[::-1])
+    if not dose_match:
+        log(f"丢弃无法识别剂量的条目：{original}")
+        return None
+
+    # 反转恢复顺序
+    num_part = dose_match.group(1)[::-1]
+    unit_part = dose_match.group(2)[::-1]
+    dose_str = f"{num_part}{unit_part}".lower().strip()
+
+    # 提取药物名称
+    pos = len(content) - dose_match.end()
+    drug_name = content[:pos].strip()
+
+    if not drug_name:
+        log(f"丢弃无名称条目：{original}")
+        return None
+
+    log(f"解析成功 → 药品={drug_name} 剂量={dose_str} 天数={days}")
+    return drug_name, dose_str, days
+
+
+def get_col_key(drug_name, dose_str):
+    """唯一键：药名|剂量"""
+    return f"{drug_name}|{dose_str}"
+
+
+def get_col_name(drug_name, dose_str):
+    """最终列名：药物名称 剂量"""
+    return f"{drug_name} {dose_str}"
+
+
+# ===================== 行处理核心 =====================
+def process_one_row(row_idx, row):
+    """
+    处理单行：返回 药物天数字典
+    遇到空编号返回 STOP
+    """
+    pid = str(row.iloc[0]).strip() if not pd.isna(row.iloc[0]) else ''
+
+    # 空编号 → 终止
+    if not pid:
+        log(f"第{row_idx + 1}行编号为空，停止后续处理")
+        return 'STOP'
+
+    log(f"\n==================== 处理第{row_idx + 1}行 编号：{pid} ====================")
+    drug_raw = row.iloc[1]
+    log(f"原始用药内容：{drug_raw}")
+
+    # 拆分条目
+    items = split_drug_items(drug_raw)
+    log(f"拆分得到 {len(items)} 条药物条目")
+
+    # 同行合并
+    current = {}
+
+    for item in items:
+        res = parse_single_item(item)
+        if not res:
+            continue
+        name, dose, day = res
+        key = get_col_key(name, dose)
+
+        if key in current:
+            old = current[key]
+            current[key] = old + day
+            log(f"→ 同行合并：{name} {dose} 天数 {old}+{day}={current[key]}")
+        else:
+            current[key] = day
+
+    # 构建行结果：所有全局列初始化为0
+    row_result = {col: 0 for col in GLOBAL_DRUG_COLUMNS.values()}
+
+    # 填充当前药物
+    for key, day_val in current.items():
+        name, dose = key.split('|', 1)
+        col = get_col_name(name, dose)
+
+        if key not in GLOBAL_DRUG_COLUMNS:
+            GLOBAL_DRUG_COLUMNS[key] = col
+            log(f"✅ 新增药物列：{col}")
+        else:
+            log(f"♻️  复用已有列：{col}")
+
+        row_result[col] = day_val
+
+    return row_result
+
+
+# ===================== 主函数 =====================
+def main():
+    if len(sys.argv) != 3:
+        print("使用方法：python table_splitter.py 输入文件.xlsx 输出文件.xlsx")
+        sys.exit(1)
+
+    input_file = sys.argv[1]
+    output_file = sys.argv[2]
+
+    try:
+        log(f"开始读取文件：{input_file}")
+        df = pd.read_excel(input_file)
+        log(f"读取完成：共 {len(df)} 行")
+
+        result = []
+        stop = False
+
+        for idx, row in df.iterrows():
+            if stop:
+                break
+            row_out = process_one_row(idx, row)
+            if row_out == 'STOP':
+                stop = True
+                continue
+
+            # 合并原始数据 + 药物列
+            row_dict = row.to_dict()
+            row_dict.update(row_out)
+            result.append(row_dict)
+
+        # 输出
+        log(f"\n==================== 处理完成 ====================")
+        out_df = pd.DataFrame(result)
+        total = len(GLOBAL_DRUG_COLUMNS)
+        log(f"✅ 全局唯一药物种类总数：{total}")
+        log(f"✅ 药物列名：{list(GLOBAL_DRUG_COLUMNS.values())}")
+
+        out_df.to_excel(output_file, index=False)
+        log(f"✅ 输出文件已保存：{output_file}")
+
+    except Exception as e:
+        log(f"❌ 错误：{str(e)}")
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
